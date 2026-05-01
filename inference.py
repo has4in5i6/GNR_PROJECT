@@ -313,38 +313,29 @@ def choose_next_patch(
 #     return np.clip(acc / weight, 0, 255).astype(np.uint8)
 
 def stitch_patches(patches: dict[int, np.ndarray]) -> np.ndarray:
-    """
-    Uses OpenCV's high-level Stitcher class with SIFT features.
-    This handles rotations, slight overlaps, and exposure blending automatically.
-    """
     import cv2
-    
-    # 1. Prepare images in order
-    # Note: We include patch_0 as it's the anchor
     imgs = [img for idx, img in sorted(patches.items())]
     
-    # 2. Create the Stitcher
-    # Mode 1 (SCANS) is optimized for flat surfaces like maps/orthophotos
+    # Try the high-level stitcher first
     stitcher = cv2.Stitcher_create(cv2.Stitcher_SCANS)
     
-    # 3. Perform Stitching
-    # This detects features (SIFT), matches them, and blends the edges
-    status, stitched = stitcher.stitch(imgs)
+    try:
+        status, stitched = stitcher.stitch(imgs)
+        if status == cv2.Stitcher_OK:
+            # Post-processing crop
+            gray = cv2.cvtColor(stitched, cv2.COLOR_BGR2GRAY)
+            _, thresh = cv2.threshold(gray, 1, 255, cv2.THRESH_BINARY)
+            contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if contours:
+                x, y, w, h = cv2.boundingRect(contours[0])
+                return stitched[y:y+h, x:x+w]
+            return stitched
+    except cv2.error as e:
+        print(f"[warn] OpenCV Stitcher crashed: {e}")
 
-    if status != cv2.Stitcher_OK:
-        print(f"[warn] Advanced stitching failed with status code {status}.")
-        print("Falling back to basic tiled alignment...")
-        return fallback_tile_stitch(patches)
-        
-    # 4. Post-processing: Remove any thin black borders created by the warping
-    gray = cv2.cvtColor(stitched, cv2.COLOR_BGR2GRAY)
-    _, thresh = cv2.threshold(gray, 1, 255, cv2.THRESH_BINARY)
-    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if contours:
-        x, y, w, h = cv2.boundingRect(contours[0])
-        stitched = stitched[y:y+h, x:x+w]
-
-    return stitched
+    # If the above fails or crashes, use the fallback grid alignment
+    print("Falling back to basic tiled alignment...")
+    return fallback_tile_stitch(patches)
 
 def fallback_tile_stitch(patches: dict[int, np.ndarray]) -> np.ndarray:
     """Simple fallback if feature matching fails: just sticks them in a grid."""
