@@ -1,0 +1,8 @@
+numpy>=1.24
+pandas>=2.0
+pillow>=10.0
+opencv-python-headless>=4.8
+accelerate>=0.34
+qwen-vl-utils[decord]>=0.0.8
+transformers>=4.51.0
+huggingface_hub>=0.24
