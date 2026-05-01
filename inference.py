@@ -200,118 +200,162 @@ def choose_next_patch(
     return best
 
 
+# def stitch_patches(patches: dict[int, np.ndarray]) -> np.ndarray:
+#     rows, cols = infer_grid_shape(len(patches))
+#     patch_h, patch_w = patches[0].shape[:2]
+
+#     rotated_candidates: list[PatchCandidate] = []
+#     for patch_id, image in patches.items():
+#         if patch_id == 0:
+#             continue
+#         for rotation in range(4):
+#             rotated = rotate_patch(image, rotation)
+#             gray = gray_float(rotated)
+#             top_border, bottom_border, left_border, right_border = border_features(gray)
+#             rotated_candidates.append(
+#                 PatchCandidate(
+#                     patch_id=patch_id,
+#                     rotation=rotation,
+#                     image=rotated,
+#                     gray=gray,
+#                     top_border=top_border,
+#                     bottom_border=bottom_border,
+#                     left_border=left_border,
+#                     right_border=right_border,
+#                 )
+#             )
+
+#     grid: list[list[np.ndarray | None]] = [[None for _ in range(cols)] for _ in range(rows)]
+#     grid_gray: list[list[np.ndarray | None]] = [[None for _ in range(cols)] for _ in range(rows)]
+#     coords: list[list[tuple[int, int] | None]] = [[None for _ in range(cols)] for _ in range(rows)]
+#     grid[0][0] = patches[0]
+#     grid_gray[0][0] = gray_float(patches[0])
+#     coords[0][0] = (0, 0)
+#     used = {0}
+
+#     while len(used) < len(patches):
+#         candidates = [item for item in rotated_candidates if item.patch_id not in used]
+#         best_cell = None
+#         best_choice = None
+#         best_score = float("inf")
+
+#         for row in range(rows):
+#             for col in range(cols):
+#                 if grid[row][col] is not None:
+#                     continue
+#                 top_neighbor_gray = grid_gray[row - 1][col] if row > 0 else None
+#                 left_neighbor_gray = grid_gray[row][col - 1] if col > 0 else None
+#                 if top_neighbor_gray is None and left_neighbor_gray is None:
+#                     continue
+
+#                 choice = choose_next_patch(
+#                     candidates, top_neighbor_gray, left_neighbor_gray, patch_h, patch_w
+#                 )
+#                 if choice[-1] < best_score:
+#                     best_score = choice[-1]
+#                     best_choice = choice
+#                     best_cell = (row, col)
+
+#         if best_cell is None or best_choice is None:
+#             raise RuntimeError("Could not expand the stitch graph")
+
+#         row, col = best_cell
+#         patch_id, _, selected, x_overlap, y_overlap, _ = best_choice
+#         top_neighbor = grid[row - 1][col] if row > 0 else None
+#         left_neighbor = grid[row][col - 1] if col > 0 else None
+
+#         grid[row][col] = selected
+#         grid_gray[row][col] = gray_float(selected)
+
+#         x = col * patch_w
+#         y = row * patch_h
+#         if left_neighbor is not None and x_overlap is not None:
+#             left_coord = coords[row][col - 1]
+#             if left_coord is not None:
+#                 left_x, left_y = left_coord
+#                 x = left_x + patch_w - x_overlap
+#                 y = left_y
+#         if top_neighbor is not None and y_overlap is not None:
+#             top_coord = coords[row - 1][col]
+#             if top_coord is not None:
+#                 top_x, top_y = top_coord
+#                 y = top_y + patch_h - y_overlap
+#                 if left_neighbor is None:
+#                     x = top_x
+#                 else:
+#                     x = int(round((x + top_x) / 2))
+#         coords[row][col] = (x, y)
+#         used.add(patch_id)
+
+#     placed = []
+#     for row in range(rows):
+#         for col in range(cols):
+#             image = grid[row][col]
+#             coord = coords[row][col]
+#             if image is None or coord is None:
+#                 continue
+#             placed.append((coord[0], coord[1], image))
+
+#     min_x = min(x for x, _, _ in placed)
+#     min_y = min(y for _, y, _ in placed)
+#     max_x = max(x + patch_w for x, _, _ in placed)
+#     max_y = max(y + patch_h for _, y, _ in placed)
+
+#     acc = np.zeros((max_y - min_y, max_x - min_x, 3), dtype=np.float32)
+#     weight = np.zeros((max_y - min_y, max_x - min_x, 1), dtype=np.float32)
+#     for x, y, image in placed:
+#         x0 = x - min_x
+#         y0 = y - min_y
+#         acc[y0 : y0 + patch_h, x0 : x0 + patch_w] += image.astype(np.float32)
+#         weight[y0 : y0 + patch_h, x0 : x0 + patch_w] += 1.0
+
+#     weight = np.maximum(weight, 1.0)
+#     return np.clip(acc / weight, 0, 255).astype(np.uint8)
+
 def stitch_patches(patches: dict[int, np.ndarray]) -> np.ndarray:
+    """
+    Uses OpenCV's high-level Stitcher class with SIFT features.
+    This handles rotations, slight overlaps, and exposure blending automatically.
+    """
+    import cv2
+    
+    # 1. Prepare images in order
+    # Note: We include patch_0 as it's the anchor
+    imgs = [img for idx, img in sorted(patches.items())]
+    
+    # 2. Create the Stitcher
+    # Mode 1 (SCANS) is optimized for flat surfaces like maps/orthophotos
+    stitcher = cv2.Stitcher_create(cv2.Stitcher_SCANS)
+    
+    # 3. Perform Stitching
+    # This detects features (SIFT), matches them, and blends the edges
+    status, stitched = stitcher.stitch(imgs)
+
+    if status != cv2.Stitcher_OK:
+        print(f"[warn] Advanced stitching failed with status code {status}.")
+        print("Falling back to basic tiled alignment...")
+        return fallback_tile_stitch(patches)
+        
+    # 4. Post-processing: Remove any thin black borders created by the warping
+    gray = cv2.cvtColor(stitched, cv2.COLOR_BGR2GRAY)
+    _, thresh = cv2.threshold(gray, 1, 255, cv2.THRESH_BINARY)
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if contours:
+        x, y, w, h = cv2.boundingRect(contours[0])
+        stitched = stitched[y:y+h, x:x+w]
+
+    return stitched
+
+def fallback_tile_stitch(patches: dict[int, np.ndarray]) -> np.ndarray:
+    """Simple fallback if feature matching fails: just sticks them in a grid."""
     rows, cols = infer_grid_shape(len(patches))
     patch_h, patch_w = patches[0].shape[:2]
-
-    rotated_candidates: list[PatchCandidate] = []
-    for patch_id, image in patches.items():
-        if patch_id == 0:
-            continue
-        for rotation in range(4):
-            rotated = rotate_patch(image, rotation)
-            gray = gray_float(rotated)
-            top_border, bottom_border, left_border, right_border = border_features(gray)
-            rotated_candidates.append(
-                PatchCandidate(
-                    patch_id=patch_id,
-                    rotation=rotation,
-                    image=rotated,
-                    gray=gray,
-                    top_border=top_border,
-                    bottom_border=bottom_border,
-                    left_border=left_border,
-                    right_border=right_border,
-                )
-            )
-
-    grid: list[list[np.ndarray | None]] = [[None for _ in range(cols)] for _ in range(rows)]
-    grid_gray: list[list[np.ndarray | None]] = [[None for _ in range(cols)] for _ in range(rows)]
-    coords: list[list[tuple[int, int] | None]] = [[None for _ in range(cols)] for _ in range(rows)]
-    grid[0][0] = patches[0]
-    grid_gray[0][0] = gray_float(patches[0])
-    coords[0][0] = (0, 0)
-    used = {0}
-
-    while len(used) < len(patches):
-        candidates = [item for item in rotated_candidates if item.patch_id not in used]
-        best_cell = None
-        best_choice = None
-        best_score = float("inf")
-
-        for row in range(rows):
-            for col in range(cols):
-                if grid[row][col] is not None:
-                    continue
-                top_neighbor_gray = grid_gray[row - 1][col] if row > 0 else None
-                left_neighbor_gray = grid_gray[row][col - 1] if col > 0 else None
-                if top_neighbor_gray is None and left_neighbor_gray is None:
-                    continue
-
-                choice = choose_next_patch(
-                    candidates, top_neighbor_gray, left_neighbor_gray, patch_h, patch_w
-                )
-                if choice[-1] < best_score:
-                    best_score = choice[-1]
-                    best_choice = choice
-                    best_cell = (row, col)
-
-        if best_cell is None or best_choice is None:
-            raise RuntimeError("Could not expand the stitch graph")
-
-        row, col = best_cell
-        patch_id, _, selected, x_overlap, y_overlap, _ = best_choice
-        top_neighbor = grid[row - 1][col] if row > 0 else None
-        left_neighbor = grid[row][col - 1] if col > 0 else None
-
-        grid[row][col] = selected
-        grid_gray[row][col] = gray_float(selected)
-
-        x = col * patch_w
-        y = row * patch_h
-        if left_neighbor is not None and x_overlap is not None:
-            left_coord = coords[row][col - 1]
-            if left_coord is not None:
-                left_x, left_y = left_coord
-                x = left_x + patch_w - x_overlap
-                y = left_y
-        if top_neighbor is not None and y_overlap is not None:
-            top_coord = coords[row - 1][col]
-            if top_coord is not None:
-                top_x, top_y = top_coord
-                y = top_y + patch_h - y_overlap
-                if left_neighbor is None:
-                    x = top_x
-                else:
-                    x = int(round((x + top_x) / 2))
-        coords[row][col] = (x, y)
-        used.add(patch_id)
-
-    placed = []
-    for row in range(rows):
-        for col in range(cols):
-            image = grid[row][col]
-            coord = coords[row][col]
-            if image is None or coord is None:
-                continue
-            placed.append((coord[0], coord[1], image))
-
-    min_x = min(x for x, _, _ in placed)
-    min_y = min(y for _, y, _ in placed)
-    max_x = max(x + patch_w for x, _, _ in placed)
-    max_y = max(y + patch_h for _, y, _ in placed)
-
-    acc = np.zeros((max_y - min_y, max_x - min_x, 3), dtype=np.float32)
-    weight = np.zeros((max_y - min_y, max_x - min_x, 1), dtype=np.float32)
-    for x, y, image in placed:
-        x0 = x - min_x
-        y0 = y - min_y
-        acc[y0 : y0 + patch_h, x0 : x0 + patch_w] += image.astype(np.float32)
-        weight[y0 : y0 + patch_h, x0 : x0 + patch_w] += 1.0
-
-    weight = np.maximum(weight, 1.0)
-    return np.clip(acc / weight, 0, 255).astype(np.uint8)
-
+    canvas = np.zeros((rows * patch_h, cols * patch_w, 3), dtype=np.uint8)
+    
+    for idx, img in patches.items():
+        r, c = divmod(idx, cols)
+        canvas[r*patch_h:(r+1)*patch_h, c*patch_w:(c+1)*patch_w] = img
+    return canvas
 
 class LocalVLM:
     def __init__(self, model_dir: Path) -> None:
@@ -330,7 +374,7 @@ class LocalVLM:
         self.model = AutoModelForImageTextToText.from_pretrained(
             str(model_dir),
             local_files_only=True,
-            torch_dtype=torch.bfloat16,
+            torch_dtype=torch.float16,  # Optimized for T4 GPUs
             device_map="auto",
         )
         self.model.eval()
